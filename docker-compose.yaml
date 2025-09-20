@@ -1,0 +1,193 @@
+version: "3.8"
+services:
+  redis:
+    container_name: linkup-redis
+    image: redis:alpine3.22
+    command: [ "redis-server", "--requirepass", "${REDIS_PASSWORD}" ]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - profile-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    container_name: postgres
+    image: postgres:latest
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5332:5432"
+    networks:
+      - profile-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  profile-service:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    container_name: profile-service
+    environment:
+      SPRING_DATASOURCE_URL: ${POSTGRES_URL}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: create-drop
+      SPRING_JPA_SHOW_SQL: false
+      SERVER_PORT: 8080
+      SPRING_REDIS_HOST: ${REDIS_HOST}
+      SPRING_REDIS_PORT: ${REDIS_PORT}
+      SPRING_REDIS_URL: ${REDIS_URL}
+      SPRING_ELASTICSEARCH_URL: ${ELASTICSEARCH_URL}
+      AWS_ACCESS_KEY: ${AWS_ACCESS_KEY}
+      AWS_SECRET_KEY: ${AWS_SECRET_KEY}
+      AWS_S3_BUCKET_NAME: ${AWS_S3_BUCKET_NAME}
+      AWS_REGION: ${AWS_REGION}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - profile-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/actuator/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  odfe-node:
+    image: elasticsearch:8.18.5
+    container_name: odfe-node
+    environment:
+      - discovery.type=single-node
+      - node.name=odfe-node
+      - discovery.seed_hosts=odfe-node
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx1024m"
+    ports:
+      - "9201:9200"
+      - "9301:9300"
+    networks:
+      - profile-network
+    volumes:
+      - odfe-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  odfe-logs-node:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.10.2
+    container_name: odfe-logs-node
+    environment:
+      - discovery.type=single-node
+      - node.name=odfe-logs-node
+      - discovery.seed_hosts=odfe-logs-node
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx1024m"
+    ports:
+      - "9202:9200"
+      - "9302:9300"
+    volumes:
+      - odfe-logs-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      - graylog-net
+
+  graylog:
+    image: graylog/graylog:6.1
+    container_name: graylog
+    environment:
+      - GRAYLOG_WEB_ENDPOINT_URI=http://127.0.0.1:9000/api
+      - GRAYLOG_ELASTICSEARCH_HOSTS=http://odfe-logs-node:9202
+      - GRAYLOG_MONGODB_URI=mongodb://mongo:27017/graylog
+      - GRAYLOG_DATA_DIR=/usr/share/graylog/data
+      - GRAYLOG_PASSWORD_SECRET=somepasswordpepper
+      - GRAYLOG_ROOT_PASSWORD_SHA2=8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918 # "admin"
+    depends_on:
+      - mongo
+      - odfe-logs-node
+    ports:
+      - "9000:9000" # Web UI
+      - "12201:12201/udp" # GELF UDP
+      - "514:514" # Syslog TCP
+      - "5555:5555" # Доп. входы
+    # restart: always
+    volumes:
+      - graylog-data:/usr/share/graylog/data
+    networks:
+      - graylog-net
+      - profile-network
+
+  mongo:
+    image: mongo:latest
+    container_name: mongo
+    # restart: always
+    networks:
+      - graylog-net
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - profile-network
+    volumes:
+      - "./prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - profile-network
+
+volumes:
+  graylog-data:
+  odfe-data:
+  odfe-logs-data:
+  postgres-data:
+  redis-data:
+  grafana-data:
+
+
+networks:
+  graylog-net:
+    driver: bridge
+  profile-network:
+    driver: bridge
